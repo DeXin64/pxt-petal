@@ -148,6 +148,15 @@ namespace petal {
         Range2048dps = 2048
     }
 
+    export enum GyroAngleType {
+        //% block="俯仰角"
+        Pitch,
+        //% block="横滚角"
+        Roll,
+        //% block="偏航角"
+        Yaw
+    }
+
     export function portToAnalogPin(port: AnalogPort): any {
         let pin = AnalogPin.P1
         switch (port) {
@@ -1007,7 +1016,6 @@ namespace petal {
     const REG_STATUS = 0x2E;
     const REG_ACCEL_START = 0x35;
     const REG_GYRO_START = 0x3B;
-    const REG_GYRO_Z_START = 0x3F;
     const REG_TEMP_LOW = 0x33; // 温度寄存器低字节
     const REG_TEMP_HIGH = 0x34; // 温度寄存器高字节
     const CTRL1_LITTLE_ENDIAN_AUTO_INC = 0x40;
@@ -1025,10 +1033,12 @@ namespace petal {
     let accelBias = { x: 0, y: 0, z: 0 };
     let gyroBias = { x: 0, y: 0, z: 0 };
     let isCalibrating = false;
+    let pitchAngleDeg = 0;
+    let rollAngleDeg = 0;
     let yawAngleDeg = 0;
-    let yawLastSampleMs = input.runningTime();
-    let yawGyroBiasRawZ = 0;
-    let yawGyroBiasReady = false;
+    let gyroAngleLastSampleMs = input.runningTime();
+    let gyroAngleBiasRaw = { x: 0, y: 0, z: 0 };
+    let gyroAngleBiasReady = false;
 
     function initSensor(RangeA: number, RangeG: number) {
         // writeRegister(REG_SELFTEST, 0xA2);  // 启动自检
@@ -1075,9 +1085,13 @@ namespace petal {
         return pins.i2cReadBuffer(QMI8658A_I2C_ADDR, len, false);
     }
 
-    function readRawGyroZ(): number {
-        let data = readBuffer(REG_GYRO_Z_START, 2);
-        return data.getNumber(NumberFormat.Int16LE, 0);
+    function readRawGyro(): { x: number, y: number, z: number } {
+        let data = readBuffer(REG_GYRO_START, 6);
+        return {
+            x: data.getNumber(NumberFormat.Int16LE, 0),
+            y: data.getNumber(NumberFormat.Int16LE, 2),
+            z: data.getNumber(NumberFormat.Int16LE, 4)
+        };
     }
 
     function absNumber(value: number): number {
@@ -1087,30 +1101,61 @@ namespace petal {
         return value;
     }
 
-    function resetYawAngleState(): void {
-        yawAngleDeg = 0;
-        yawLastSampleMs = input.runningTime();
+    function applyGyroDeadband(value: number): number {
+        if (absNumber(value) < GYRO_DEADBAND_DPS) {
+            return 0;
+        }
+        return value;
     }
 
-    function calibrateYawGyroZ(): void {
-        let sum = 0;
+    function resetAllGyroAngleState(): void {
+        pitchAngleDeg = 0;
+        rollAngleDeg = 0;
+        yawAngleDeg = 0;
+        gyroAngleLastSampleMs = input.runningTime();
+    }
+
+    function resetGyroAngleState(angleType: GyroAngleType): void {
+        switch (angleType) {
+            case GyroAngleType.Pitch:
+                pitchAngleDeg = 0;
+                break;
+            case GyroAngleType.Roll:
+                rollAngleDeg = 0;
+                break;
+            case GyroAngleType.Yaw:
+                yawAngleDeg = 0;
+                break;
+        }
+        gyroAngleLastSampleMs = input.runningTime();
+    }
+
+    function calibrateGyroAngle(): void {
+        let sum = { x: 0, y: 0, z: 0 };
         let sampleTotal = 200;
 
         for (let i = 0; i < 20; i++) {
-            readRawGyroZ();
+            readRawGyro();
             basic.pause(5);
         }
 
         for (let j = 0; j < sampleTotal; j++) {
-            sum += readRawGyroZ();
+            let raw = readRawGyro();
+            sum.x += raw.x;
+            sum.y += raw.y;
+            sum.z += raw.z;
             basic.pause(5);
         }
 
-        yawGyroBiasRawZ = sum / sampleTotal;
-        yawGyroBiasReady = true;
+        gyroAngleBiasRaw = {
+            x: sum.x / sampleTotal,
+            y: sum.y / sampleTotal,
+            z: sum.z / sampleTotal
+        };
+        gyroAngleBiasReady = true;
     }
 
-    function ensureYawAngleReady(): void {
+    function ensureGyroAngleReady(): void {
         if (_6AxisImuFlag == true) {
             currentAccelRange = AccelScale6.Range_2G;
             currentGyroRange = GyroRange6.Range512dps;
@@ -1118,24 +1163,15 @@ namespace petal {
             _6AxisImuFlag = false;
         }
 
-        if (!yawGyroBiasReady) {
-            calibrateYawGyroZ();
-            resetYawAngleState();
+        if (!gyroAngleBiasReady) {
+            calibrateGyroAngle();
+            resetAllGyroAngleState();
         }
     }
 
-    function readYawGyroZ(): number {
-        let gyroScale = currentGyroRange / 32768.0;
-        let gyroZ = (readRawGyroZ() - yawGyroBiasRawZ) * gyroScale;
-        if (absNumber(gyroZ) < GYRO_DEADBAND_DPS) {
-            gyroZ = 0;
-        }
-        return gyroZ;
-    }
-
-    function updateYawAngle(): void {
+    function updateGyroAngles(): void {
         let now = input.runningTime();
-        let dtMs = now - yawLastSampleMs;
+        let dtMs = now - gyroAngleLastSampleMs;
         if (dtMs < 0) {
             dtMs = 0;
         }
@@ -1143,11 +1179,19 @@ namespace petal {
             dtMs = MAX_YAW_DT_MS;
         }
 
-        yawAngleDeg += readYawGyroZ() * dtMs / 1000;
-        yawLastSampleMs = now;
+        let raw = readRawGyro();
+        let gyroScale = currentGyroRange / 32768.0;
+        let gyroPitch = applyGyroDeadband((0 - (raw.y - gyroAngleBiasRaw.y)) * gyroScale);
+        let gyroRoll = applyGyroDeadband((0 - (raw.x - gyroAngleBiasRaw.x)) * gyroScale);
+        let gyroYaw = applyGyroDeadband((raw.z - gyroAngleBiasRaw.z) * gyroScale);
+
+        pitchAngleDeg += gyroPitch * dtMs / 1000;
+        rollAngleDeg += gyroRoll * dtMs / 1000;
+        yawAngleDeg += gyroYaw * dtMs / 1000;
+        gyroAngleLastSampleMs = now;
     }
 
-    function normalizeYawAngle360(angle: number): number {
+    function normalizeAngle360(angle: number): number {
         let normalized = angle % 360;
         if (normalized < 0) {
             normalized += 360;
@@ -1231,9 +1275,13 @@ namespace petal {
             y: gyroSamples.y / sampleCount,
             z: gyroSamples.z / sampleCount
         };
-        yawGyroBiasRawZ = gyroBias.z;
-        yawGyroBiasReady = true;
-        resetYawAngleState();
+        gyroAngleBiasRaw = {
+            x: gyroBias.x,
+            y: gyroBias.y,
+            z: gyroBias.z
+        };
+        gyroAngleBiasReady = true;
+        resetAllGyroAngleState();
 
         isCalibrating = false;
     }
@@ -1296,23 +1344,56 @@ namespace petal {
     }
 
     /**
+     * Get the selected gyro angle of the six-axis IMU sensor in 0-360 degrees.
+     * @param angleType select pitch, roll, or yaw
+     */
+    //% blockId="petal_getGyroAngle360" block="获取 %angleType（0-360）"
+    //% angleType.defl=petal.GyroAngleType.Yaw
+    //% color=#00B1ED weight=9 group="IIC"
+    export function getGyroAngle360(angleType: GyroAngleType): number {
+        ensureGyroAngleReady();
+        updateGyroAngles();
+        switch (angleType) {
+            case GyroAngleType.Pitch:
+                return normalizeAngle360(pitchAngleDeg);
+            case GyroAngleType.Roll:
+                return normalizeAngle360(rollAngleDeg);
+            case GyroAngleType.Yaw:
+                return normalizeAngle360(yawAngleDeg);
+            default:
+                return 0;
+        }
+    }
+
+    /**
+     * Set the selected gyro angle of the six-axis IMU sensor to 0.
+     * @param angleType select pitch, roll, or yaw
+     */
+    //% blockId="petal_setGyroAngleZero" block="将 %angleType 设置为0"
+    //% angleType.defl=petal.GyroAngleType.Yaw
+    //% color=#00B1ED weight=8 group="IIC"
+    export function setGyroAngleZero(angleType: GyroAngleType): void {
+        ensureGyroAngleReady();
+        updateGyroAngles();
+        resetGyroAngleState(angleType);
+    }
+
+    /**
      * Get the yaw angle of the six-axis IMU sensor in 0-360 degrees.
      */
     //% blockId="petal_getYawAngle360" block="获取偏航角度（0-360）"
-    //% color=#00B1ED weight=9 group="IIC"
+    //% blockHidden=true
     export function getYawAngle360(): number {
-        ensureYawAngleReady();
-        updateYawAngle();
-        return normalizeYawAngle360(yawAngleDeg);
+        return getGyroAngle360(GyroAngleType.Yaw);
     }
 
     /**
      * Set the yaw angle of the six-axis IMU sensor to 0.
      */
     //% blockId="petal_setYawAngleZero" block="将偏航角度设置为0"
-    //% color=#00B1ED weight=8 group="IIC"
+    //% blockHidden=true
     export function setYawAngleZero(): void {
-        resetYawAngleState();
+        setGyroAngleZero(GyroAngleType.Yaw);
     }
 
     function writeRegister(reg: number, value: number) {
