@@ -97,6 +97,8 @@
   "Petal_IOT.uploadSmartiot": "upload data to kitsiot",
   "Petal_IOT.wait": "Wait between uploads",
   "Petal_IOT.wifiState": "Check if ESP8266 successfully connected to Wifi",
+  "petal.getYawAngle360": "偏航角度",
+  "petal.setYawAngleZero": "将偏航角度设为 0",
   "Petal_Basic.TrackBit_get_offset": "获取位置偏移量，范围从-3000到3000。",
   "Petal_Basic.TrackbitgetGray": "读取灰度值，范围从0到255。"
 }

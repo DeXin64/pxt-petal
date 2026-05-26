@@ -1004,11 +1004,17 @@ namespace petal {
     const REG_GYRO_CONFIG = 0x04;
     const REG_FILTER_CONFIG = 0x06;
     const REG_POWER_CONFIG = 0x08;
-    const REG_STATUS = 0x2D;
+    const REG_STATUS = 0x2E;
     const REG_ACCEL_START = 0x35;
     const REG_GYRO_START = 0x3B;
+    const REG_GYRO_Z_START = 0x3F;
     const REG_TEMP_LOW = 0x33; // 温度寄存器低字节
     const REG_TEMP_HIGH = 0x34; // 温度寄存器高字节
+    const CTRL1_LITTLE_ENDIAN_AUTO_INC = 0x40;
+    const CTRL5_GYRO_LPF = 0x70;
+    const CTRL7_ENABLE_ACCEL_GYRO = 0x03;
+    const GYRO_DEADBAND_DPS = 0.6;
+    const MAX_YAW_DT_MS = 500;
 
     let _6AxisImuFlag = true;
 
@@ -1019,14 +1025,18 @@ namespace petal {
     let accelBias = { x: 0, y: 0, z: 0 };
     let gyroBias = { x: 0, y: 0, z: 0 };
     let isCalibrating = false;
+    let yawAngleDeg = 0;
+    let yawLastSampleMs = input.runningTime();
+    let yawGyroBiasRawZ = 0;
+    let yawGyroBiasReady = false;
 
     function initSensor(RangeA: number, RangeG: number) {
         // writeRegister(REG_SELFTEST, 0xA2);  // 启动自检
         // basic.pause(1750);                  // 等待自检完成
         // writeRegister(REG_SELFTEST, 0x00);  // 退出自检模式（部分传感器需要此操作）
         // basic.pause(100)
-        writeRegister(REG_I2C_CONFIG, 0x60);    // 重新配置I2C
-        basic.pause(100)
+        writeRegister(REG_I2C_CONFIG, CTRL1_LITTLE_ENDIAN_AUTO_INC);    // 重新配置I2C
+        basic.pause(20)
         let regValue = 0x00;
         switch (RangeA) {
             case 2: regValue = 0x00; break;
@@ -1038,19 +1048,20 @@ namespace petal {
         regValue = 0x00;
         switch (RangeG) {
             case 16: regValue = 0x00; break; // ±16dps (000)
-            case 32: regValue = 0x20; break; // ±32dps (001 << 4)
-            case 64: regValue = 0x40; break; // ±64dps (010 << 4)
-            case 128: regValue = 0x60; break; // ±128dps (011 << 4)
-            case 256: regValue = 0x80; break; // ±256dps (100 << 4)
-            case 512: regValue = 0xA0; break; // ±512dps (101 << 4)
-            case 1024: regValue = 0xC0; break; // ±1024dps (110 << 4)
-            case 2048: regValue = 0xE0; break; // ±2048dps (111 << 4)
+            case 32: regValue = 0x10; break; // ±32dps (001 << 4)
+            case 64: regValue = 0x20; break; // ±64dps (010 << 4)
+            case 128: regValue = 0x30; break; // ±128dps (011 << 4)
+            case 256: regValue = 0x40; break; // ±256dps (100 << 4)
+            case 512: regValue = 0x50; break; // ±512dps (101 << 4)
+            case 1024: regValue = 0x60; break; // ±1024dps (110 << 4)
+            case 2048: regValue = 0x70; break; // ±2048dps (111 << 4)
         }
         regValue |= 0x04;
         writeRegister(REG_GYRO_CONFIG, regValue);
 
-        writeRegister(REG_FILTER_CONFIG, 0x01); // 低通滤波器配置
-        writeRegister(REG_POWER_CONFIG, 0x03);  // 电源管理模式
+        writeRegister(REG_FILTER_CONFIG, CTRL5_GYRO_LPF); // 低通滤波器配置
+        writeRegister(REG_POWER_CONFIG, CTRL7_ENABLE_ACCEL_GYRO);  // 电源管理模式
+        basic.pause(100)
     }
 
 
@@ -1059,13 +1070,102 @@ namespace petal {
         return (status & 0x01) === 1;
     }
 
+    function readBuffer(reg: number, len: number): Buffer {
+        pins.i2cWriteNumber(QMI8658A_I2C_ADDR, reg, NumberFormat.UInt8LE, true);
+        return pins.i2cReadBuffer(QMI8658A_I2C_ADDR, len, false);
+    }
+
+    function readRawGyroZ(): number {
+        let data = readBuffer(REG_GYRO_Z_START, 2);
+        return data.getNumber(NumberFormat.Int16LE, 0);
+    }
+
+    function absNumber(value: number): number {
+        if (value < 0) {
+            return 0 - value;
+        }
+        return value;
+    }
+
+    function resetYawAngleState(): void {
+        yawAngleDeg = 0;
+        yawLastSampleMs = input.runningTime();
+    }
+
+    function calibrateYawGyroZ(): void {
+        let sum = 0;
+        let sampleTotal = 200;
+
+        for (let i = 0; i < 20; i++) {
+            readRawGyroZ();
+            basic.pause(5);
+        }
+
+        for (let j = 0; j < sampleTotal; j++) {
+            sum += readRawGyroZ();
+            basic.pause(5);
+        }
+
+        yawGyroBiasRawZ = sum / sampleTotal;
+        yawGyroBiasReady = true;
+    }
+
+    function ensureYawAngleReady(): void {
+        if (_6AxisImuFlag == true) {
+            currentAccelRange = AccelScale6.Range_2G;
+            currentGyroRange = GyroRange6.Range512dps;
+            initSensor(currentAccelRange, currentGyroRange);
+            _6AxisImuFlag = false;
+        }
+
+        if (!yawGyroBiasReady) {
+            calibrateYawGyroZ();
+            resetYawAngleState();
+        }
+    }
+
+    function readYawGyroZ(): number {
+        let gyroScale = currentGyroRange / 32768.0;
+        let gyroZ = (readRawGyroZ() - yawGyroBiasRawZ) * gyroScale;
+        if (absNumber(gyroZ) < GYRO_DEADBAND_DPS) {
+            gyroZ = 0;
+        }
+        return gyroZ;
+    }
+
+    function updateYawAngle(): void {
+        let now = input.runningTime();
+        let dtMs = now - yawLastSampleMs;
+        if (dtMs < 0) {
+            dtMs = 0;
+        }
+        if (dtMs > MAX_YAW_DT_MS) {
+            dtMs = MAX_YAW_DT_MS;
+        }
+
+        yawAngleDeg += readYawGyroZ() * dtMs / 1000;
+        yawLastSampleMs = now;
+    }
+
+    function normalizeYawAngle360(angle: number): number {
+        let normalized = angle % 360;
+        if (normalized < 0) {
+            normalized += 360;
+        }
+
+        let rounded = Math.round(normalized);
+        if (rounded >= 360) {
+            rounded = 0;
+        }
+        return rounded;
+    }
+
     function readData(): { ax: number, ay: number, az: number, gx: number, gy: number, gz: number, temperature: number } {
         let rawData = pins.createBuffer(12);  // 存储从传感器读取的12个字节的数据（加速度计和陀螺仪）
         let tempData = pins.createBuffer(2);  // 存储从传感器读取的2个字节的数据（温度）
 
         // 读取加速度计和陀螺仪数据
-        pins.i2cWriteNumber(QMI8658A_I2C_ADDR, REG_ACCEL_START, NumberFormat.UInt8LE, true); // 发送寄存器地址，并重启
-        rawData = pins.i2cReadBuffer(QMI8658A_I2C_ADDR, 12, false);
+        rawData = readBuffer(REG_ACCEL_START, 12);
 
         let ax = (rawData.getNumber(NumberFormat.Int16LE, 0));
         let ay = (rawData.getNumber(NumberFormat.Int16LE, 2));
@@ -1090,6 +1190,11 @@ namespace petal {
     //% blockId="petal__6AxisImuWrite" block="six AxisImu sensor calibration (static 3 seconds)"
     //% color=#00B1ED weight=11 group="IIC"
     export function _6AxisImuWrite(): void {
+        if (_6AxisImuFlag == true) {
+            initSensor(currentAccelRange, currentGyroRange);
+            _6AxisImuFlag = false;
+        }
+
         isCalibrating = true;
 
         // Step 1: 初始化采样数据
@@ -1126,6 +1231,9 @@ namespace petal {
             y: gyroSamples.y / sampleCount,
             z: gyroSamples.z / sampleCount
         };
+        yawGyroBiasRawZ = gyroBias.z;
+        yawGyroBiasReady = true;
+        resetYawAngleState();
 
         isCalibrating = false;
     }
@@ -1185,6 +1293,26 @@ namespace petal {
             default:
                 return 0;
         }
+    }
+
+    /**
+     * Get the yaw angle of the six-axis IMU sensor in 0-360 degrees.
+     */
+    //% blockId="petal_getYawAngle360" block="获取偏航角度（0-360）"
+    //% color=#00B1ED weight=9 group="IIC"
+    export function getYawAngle360(): number {
+        ensureYawAngleReady();
+        updateYawAngle();
+        return normalizeYawAngle360(yawAngleDeg);
+    }
+
+    /**
+     * Set the yaw angle of the six-axis IMU sensor to 0.
+     */
+    //% blockId="petal_setYawAngleZero" block="将偏航角度设置为0"
+    //% color=#00B1ED weight=8 group="IIC"
+    export function setYawAngleZero(): void {
+        resetYawAngleState();
     }
 
     function writeRegister(reg: number, value: number) {

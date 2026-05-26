@@ -72,6 +72,8 @@
   "petal.trackingSensor|block": "巡线传感器 %port 识别到 %state",
   "petal._6AxisImuWrite|block": "六轴IMU传感器校准(静止3秒)",
   "petal._6AxisImuRead|block": "六轴IMU传感器读取 %state 值 %rangeA %RangeG",
+  "petal.getYawAngle360|block": "获取偏航角度（0-360）",
+  "petal.setYawAngleZero|block": "将偏航角度设置为0",
   "petal.accelWrite|block": "加速度计传感器校准(静止3秒)",
   "petal.accelRead|block": "加速度计传感器读取 %state 值 %Range",
   "Petal_Display.DigitalPort.J1|block": "J1",
